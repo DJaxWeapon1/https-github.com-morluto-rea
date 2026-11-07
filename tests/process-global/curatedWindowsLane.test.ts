@@ -145,6 +145,27 @@ describe("curated Windows test lane", () => {
     expect(build).toBeGreaterThan(verify);
   });
 
+  it("self-inspects the Windows source build before the cross-built addon replaces it", async () => {
+    const workflow = workflowSchema.parse(
+      parse(await readFile(WORKFLOW, "utf8")),
+    );
+    const steps = workflow.jobs["windows-curated"]?.steps ?? [];
+    const sourceBuild = steps.findIndex((step) =>
+      step.run?.includes("npm run build:windows-native"),
+    );
+    const inspection = steps.findIndex(
+      (step) =>
+        step.run?.includes("addon.call('inspect', [])") &&
+        step.run.includes("inspection.runtimeWriteTransient !== true"),
+    );
+    const download = steps.findIndex(
+      (step) => step.with?.name === "windows-native-controls",
+    );
+    expect(sourceBuild).toBeGreaterThanOrEqual(0);
+    expect(inspection).toBeGreaterThan(sourceBuild);
+    expect(download).toBeGreaterThan(inspection);
+  });
+
   it("executes native behavior and recovery proofs before unrelated curated tests", async () => {
     const workflow = workflowSchema.parse(
       parse(await readFile(WORKFLOW, "utf8")),
