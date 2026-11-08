@@ -54,7 +54,51 @@ const draft = (files: Record<string, DesktopStatePath>) =>
     new Map(Object.entries(files)),
     (home) => home !== "elsewhere",
     { seed: 0, end: 1 },
+    { stateDirectories: [], kept: [], selected: [] },
   );
+
+it("omits checks for a lock left out of a selected folder but retains an explicitly selected lock", () => {
+  const files = new Map(
+    Object.entries({
+      "Documents/plan.vym": path("document", "text", text("old"), text("new")),
+      "Documents/plan.vym.lock": path(
+        "document",
+        "text",
+        text("pid 1"),
+        text("pid 2"),
+      ),
+    }),
+  );
+  const ends = { seed: 0, end: 1 };
+  const selecting = (selected: readonly string[]) => ({
+    stateDirectories: [],
+    kept: selected,
+    selected,
+  });
+  const fromFolder = draftTaskFiles(
+    files,
+    () => true,
+    ends,
+    selecting(["Documents"]),
+  );
+  expect(
+    fromFolder.find(({ file }) => file === "Documents/plan.vym")?.suggested
+      .length,
+  ).toBeGreaterThan(0);
+  expect(
+    fromFolder.find(({ file }) => file === "Documents/plan.vym.lock"),
+  ).toMatchObject({ suggested: [], values: [], guards: [] });
+  const explicit = draftTaskFiles(
+    files,
+    () => true,
+    ends,
+    selecting(["Documents/plan.vym.lock"]),
+  );
+  expect(
+    explicit.find(({ file }) => file === "Documents/plan.vym.lock")?.suggested
+      .length,
+  ).toBeGreaterThan(0);
+});
 
 describe("draftTaskFiles", () => {
   it("suggests the lines a document gained and lost, and leaves the app's state without views", () => {
@@ -187,7 +231,7 @@ describe("draftTaskFiles for structured views", () => {
       {
         kind: "value_equals",
         file: ".config/app/state.json",
-        pointer: "/recent/0/name",
+        pointer: "/recent/[name=a.txt]/name",
         value: "a.txt",
       },
       {
@@ -319,7 +363,8 @@ describe("draftTaskFiles for XML that uses namespaces", () => {
 
 describe("draftTaskFiles for an AbiWord document", () => {
   const FIXTURES = join(import.meta.dirname, "../../../tests/fixtures");
-  const PARAGRAPH = "/root/children/[name=section]/children/[name=p][@xid=3]";
+  const PARAGRAPH =
+    "/root/children/[name=section][@xid=1]/children/[name=p][@xid=3]";
 
   it("suggests an AbiWord paragraph's whole text first, no save time, and nothing by position", async () => {
     const [before, after] = await Promise.all(
@@ -379,7 +424,8 @@ describe("draftTaskFiles for text split into runs", () => {
       ]),
       truncated: false,
     });
-    const sixth = "/root/children/[name=section]/children/[name=p][@xid=6]";
+    const sixth =
+      "/root/children/[name=section][@xid=1]/children/[name=p][@xid=6]";
     const edits: readonly (readonly [JsonValue[], JsonValue[], string])[] = [
       // Text replaced by a run, as AbiWord types into a reopened document.
       [["Meeting at 2:00"], [run("Meeting at 3:30")], "Meeting at 3:30"],
@@ -597,7 +643,8 @@ describe("draftTaskFiles for runs added or removed whole", () => {
         {
           kind: "text_equals",
           file: "Documents/note.abw",
-          pointer: "/root/children/[name=section]/children/[name=p][@xid=6]",
+          pointer:
+            "/root/children/[name=section][@xid=1]/children/[name=p][@xid=6]",
           value: text,
         },
       ]);
@@ -796,7 +843,7 @@ describe("draftTaskFiles for text in an element its tag names alone", () => {
     });
     expect(saved?.suggested).toEqual(
       check(
-        "/root/children/[name=g]/children/[name=text][@id=headline]",
+        "/root/children/[name=g][@id=layer1]/children/[name=text][@id=headline]",
         "Summer Bake Sale",
       ),
     );
@@ -834,7 +881,8 @@ describe("draftTaskFiles for elements added whole holding text", () => {
       {
         kind: "text_equals",
         file: "Documents/note.abw",
-        pointer: "/root/children/[name=section]/children/[name=p][@xid=6]",
+        pointer:
+          "/root/children/[name=section][@xid=1]/children/[name=p][@xid=6]",
         value: "Meeting at 3:30",
       },
     ]);
@@ -851,10 +899,14 @@ describe("draftTaskFiles for elements added whole holding text", () => {
 
   it("checks a new paragraph's text at a section short enough to check, and otherwise its own, rather than that it is there", () => {
     const sections = [
-      ["Agenda", "/root/children/[name=section]", "AgendaBring the minutes"],
+      [
+        "Agenda",
+        "/root/children/[name=section][@xid=1]",
+        "AgendaBring the minutes",
+      ],
       [
         "Agenda. ".repeat(300),
-        "/root/children/[name=section]/children/[name=p][@xid=7]",
+        "/root/children/[name=section][@xid=1]/children/[name=p][@xid=7]",
         "Bring the minutes",
       ],
     ] as const;
@@ -874,13 +926,34 @@ describe("draftTaskFiles for elements added whole holding text", () => {
         ),
       });
 
-      expect(file?.suggested).toEqual([
-        { kind: "text_equals", file: "Documents/note.abw", pointer, value },
-      ]);
+      expect(file?.suggested[0]).toEqual({
+        kind: "text_equals",
+        file: "Documents/note.abw",
+        pointer,
+        value,
+      });
+      // A paragraph the section's own check covers is a run of its text; one checked apart is counted.
+      expect(file?.suggested.slice(1)).toEqual(
+        pointer.endsWith("[@xid=7]")
+          ? [
+              {
+                kind: "member_count",
+                file: "Documents/note.abw",
+                pointer: "/root/children/[name=section][@xid=1]/children",
+                matching: "[name=p]",
+                equals: 2,
+              },
+            ]
+          : [],
+      );
       expect(
         [[minutes("Bring the minutes")], [minutes("Bring the agenda")], []].map(
           (added) =>
-            passing("Documents/note.abw", file?.suggested, note(added)),
+            passing(
+              "Documents/note.abw",
+              file?.suggested.slice(0, 1),
+              note(added),
+            ),
         ),
       ).toEqual([[true], [false], [false]]);
     }
@@ -963,7 +1036,8 @@ describe("draftTaskFiles for elements without text beside a text edit", () => {
       ]),
       truncated: false,
     });
-    const sixth = "/root/children/[name=section]/children/[name=p][@xid=6]";
+    const sixth =
+      "/root/children/[name=section][@xid=1]/children/[name=p][@xid=6]";
     const image = xmlElement("image", { dataid: "image_1" });
     const brk = xmlElement("br");
     const edits = [
@@ -1024,6 +1098,38 @@ describe("draftTaskFiles for elements without text beside a text edit", () => {
         [true, false],
       ]);
     }
+  });
+});
+
+describe("draftTaskFiles for a whitespace-only run", () => {
+  it("covers a whitespace-only run with the paragraph text check and does not require that run", () => {
+    const file = "Documents/note.abw";
+    const note = (sixth: JsonValue[]): JsonValue => ({
+      root: xmlElement("abiword", {}, [
+        xmlElement("section", { xid: "1" }, [
+          xmlElement("p", { xid: "6" }, sixth),
+        ]),
+      ]),
+      truncated: false,
+    });
+    const edited = ["Hello", xmlElement("c", {}, [" "]), "there"];
+    const [draftFile] = draft({
+      [file]: path("document", "xml", note(["Hello"]), note(edited)),
+    });
+    const paragraph = "/root/children/[name=section]/children/[name=p]";
+    expect(draftFile?.suggested).toEqual([
+      {
+        kind: "text_equals",
+        file,
+        pointer: paragraph,
+        value: "Hello there",
+      },
+    ]);
+    expect(
+      [edited, ["Hello", " ", "there"]].map((saved) =>
+        passing(file, draftFile?.suggested, note(saved)),
+      ),
+    ).toEqual([[true], [true]]);
   });
 });
 
@@ -1411,7 +1517,7 @@ describe("draftTaskFiles archives added to whole", () => {
     ]);
   });
 
-  it("suggests no element by its position, even at the last step", () => {
+  it("suggests no element by its position, even at the last step, and counts the paragraphs instead", () => {
     const page = (paragraphs: string[]) =>
       listing([
         zipEntry("page.xml", "xml", {
@@ -1433,7 +1539,17 @@ describe("draftTaskFiles archives added to whole", () => {
       ),
     });
 
-    expect(file).toMatchObject({ change: { kind: "values" }, suggested: [] });
+    expect(file).toMatchObject({
+      change: { kind: "values" },
+      suggested: [
+        {
+          kind: "member_count",
+          pointer: "/entries/[name=page.xml]/view/root/children",
+          matching: "[name=p]",
+          equals: 2,
+        },
+      ],
+    });
   });
 });
 
@@ -1464,8 +1580,8 @@ describe("draftTaskFiles archive elements by identity", () => {
       {
         kind: "value_equals",
         file: "Documents/plate.zip",
-        pointer: `${objects}/[name=Object][@name=Hole001]/name`,
-        value: "Object",
+        pointer: `${objects}/[name=Object][@name=Hole001]/attributes/type`,
+        value: "Part::Cylinder",
       },
       {
         kind: "value_absent",
@@ -1701,8 +1817,8 @@ describe("draftTaskFiles archives", () => {
       {
         kind: "value_equals",
         file: "Documents/plate.FCStd",
-        pointer: `${objects}/[name=Object][@name=Hole]/name`,
-        value: "Object",
+        pointer: `${objects}/[name=Object][@name=Hole]/attributes/type`,
+        value: "Part::Cylinder",
       },
       {
         kind: "value_absent",
