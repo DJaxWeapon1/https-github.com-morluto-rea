@@ -3,6 +3,7 @@ import { z } from "zod";
 
 import {
   createEvidenceBundle,
+  MAX_EVIDENCE_BUNDLE_JSON_DEPTH,
   createImmutableEvidenceBundle,
   isImmutableEvidenceBundle,
   safeParseImmutableEvidenceBundle,
@@ -17,6 +18,7 @@ import { EvidenceIntegrityError } from "../../domain/evidenceErrors.js";
 import { UnknownRegistryError } from "../../domain/unknownRegistryError.js";
 import {
   isImmutableEvidence,
+  MAX_EVIDENCE_JSON_DEPTH,
   evidenceDisplayMetadataAgree,
   type Evidence,
 } from "../../domain/evidence.js";
@@ -129,6 +131,7 @@ export class EvidenceLedger {
         input,
         "import_evidence_bundle",
         this.retentionPolicy,
+        MAX_EVIDENCE_BUNDLE_JSON_DEPTH,
       );
       if (!headroom.ok) return headroom;
     }
@@ -634,6 +637,7 @@ export class EvidenceLedger {
         input,
         operation,
         this.retentionPolicy,
+        MAX_EVIDENCE_JSON_DEPTH,
       );
       if (!headroom.ok) return headroom;
     }
