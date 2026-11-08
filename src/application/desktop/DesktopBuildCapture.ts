@@ -1,6 +1,18 @@
+import { z } from "zod";
+
 import { AnalysisError } from "../../domain/analysisErrorBase.js";
+import { AnalysisCancelledError } from "../../domain/analysisErrorCore.js";
 import type { BuildRequest } from "../../domain/desktop/appBuild.js";
-import { BUILD_PACKAGE_FILE } from "../../domain/desktop/appBuild.js";
+import {
+  SIGN_IN_END,
+  SIGN_IN_START,
+  type BuildConsent,
+} from "../../domain/desktop/appWithheld.js";
+import type { KnownSecret } from "../../domain/desktop/buildSecrets.js";
+import {
+  BUILD_PACKAGE_FILE,
+  extraPackagesOf,
+} from "../../domain/desktop/appBuild.js";
 import {
   END_CHECKPOINT,
   SEED_CHECKPOINT,
@@ -9,15 +21,22 @@ import {
   captureProgressEvent,
   type DesktopCaptureEvent,
 } from "../../domain/desktop/desktopCapture.js";
+import type { JsonValue } from "../../domain/jsonValue.js";
 import { ProviderAdapterError } from "../../domain/providerAdapterError.js";
 import { err, ok, type Result } from "../../domain/result.js";
 import { AGENTENV_PROVIDER } from "../../desktop/AgentEnvComputerHelper.js";
 import type { ControlledComputer } from "../../desktop/BuildComputerController.js";
 import {
+  endedCapture,
+  notAnswered,
+  type CaptureStep,
+} from "./DesktopBuildCaptureFailure.js";
+import {
   adapterError,
   controller,
   errorText,
   refused,
+  runRea,
   WORK,
   type Answer,
 } from "./DesktopBuildCommands.js";
@@ -35,29 +54,124 @@ const START = "start_build_capture";
 const MARK = "mark_build_checkpoint";
 const STOP = "stop_build_capture";
 const EXPORT = "export_build_environment";
+/** The start's step, for a capture that ended before the app's window opened. */
+const STARTING: CaptureStep = {
+  operation: START,
+  when: "before the app's window opened",
+  afterAppExit:
+    "The app does not run as installed: check what it needs, such as a runtime its stderr names, and name that package in an archive install's extra_packages, or install the app from another source, on a new build computer; close this one.",
+};
+/** A checkpoint's step, for a capture that ended before acknowledging it. */
+const marking = (name: string): CaptureStep => ({
+  operation: MARK,
+  when: `before checkpoint ${name}`,
+  afterAppExit:
+    "The capture ended with the app: stop_build_capture reads what it recorded, then start_build_capture captures again.",
+});
 const NOT_RUNNING = [
   "No capture is running on this computer.",
   "Start one with start_build_capture.",
 ] as const;
 
+/** What the agent asks of a capture's launch: arguments for the app, and files or folders in the home that are its state. */
+export interface CaptureInput {
+  readonly arguments?: readonly string[] | undefined;
+  readonly state_paths?: readonly string[] | undefined;
+}
+
+const exportOptionsSchema = z.object({
+  options: z.object({ properties: z.record(z.string(), z.unknown()) }),
+});
+const repackRuntime =
+  "Run npm run pack:build-computer-runtime -- /absolute/path/rea-prod.tar.xz in a current REA checkout, set REA_BUILD_COMPUTER_REA_ARCHIVE to that archive, restart the REA MCP server, and start a new build computer.";
+const schemaCommandError = (exitCode: number | null, detail: string) =>
+  new ProviderAdapterError(AGENTENV_PROVIDER, START, {
+    userMessage: `The build computer's REA export schema command ${exitCode === null ? "ended without an exit status" : `exited ${String(exitCode)}`}: ${detail}`,
+    remediationAction: `Inspect the command error. If the runtime is outdated, ${repackRuntime}`,
+  });
+
+/** Check the installed runtime's advertised export contract before capturing the user's work. */
+const checkExportRuntime = async (
+  computer: ControlledComputer,
+  signal: AbortSignal,
+): Promise<Result<void, AnalysisError>> => {
+  try {
+    const path = `${WORK}/export-schema.json`;
+    const command = await runRea(
+      computer,
+      ["export-desktop-application", "--schema", "--json"],
+      { stdout: path, timeoutS: 30, signal },
+    );
+    if (command.exitCode !== 0 && command.stderr !== "")
+      return err(schemaCommandError(command.exitCode, command.stderr));
+    if (command.stdoutBytes > 1024 * 1024)
+      return err(
+        adapterError(
+          START,
+          "The build computer's REA export schema exceeds 1 MiB.",
+        ),
+      );
+    const content = (
+      await computer.homeFiles([path], command.stdoutBytes, signal)
+    ).get(path);
+    if (content === undefined)
+      return err(
+        adapterError(
+          START,
+          "The build computer did not return its REA export schema.",
+        ),
+      );
+    if (command.exitCode !== 0)
+      return err(
+        schemaCommandError(
+          command.exitCode,
+          content.toString("utf8").slice(-2048),
+        ),
+      );
+    const schema = exportOptionsSchema.safeParse(
+      JSON.parse(content.toString("utf8")),
+    );
+    if (!schema.success)
+      return err(
+        adapterError(
+          START,
+          "The build computer's REA returned an invalid export schema.",
+        ),
+      );
+    if (!("syntheticSeed" in schema.data.options.properties))
+      return err(
+        refused(
+          START,
+          "The REA runtime in this build computer does not support synthetic seeds required by build export.",
+          repackRuntime,
+        ),
+      );
+    return ok(undefined);
+  } catch (cause: unknown) {
+    return err(
+      signal.aborted
+        ? new AnalysisCancelledError(START, { cause: signal.reason })
+        : adapterError(
+            START,
+            `Could not read the build computer's REA export schema: ${errorText(cause)}`,
+            cause,
+          ),
+    );
+  }
+};
+
+/** A taken checkpoint as the tool reports it: changed files null when the REA in the computer predates them. */
 type CheckpointTaken = Omit<
   Extract<DesktopCaptureEvent, { kind: "checkpoint" }>,
-  "kind"
->;
+  "kind" | "changed_files" | "more_changed_files"
+> & {
+  readonly changed_files: string[] | null;
+  readonly more_changed_files: number | null;
+};
 
 /** The capture's progress event in a line the controller waited for. */
 const eventOf = (line: string): DesktopCaptureEvent | undefined =>
   captureProgressEvent(line);
-
-/** Why the capture is not answering, from what the controller saw instead of the event. */
-const notAnswered = (operation: string, answer: Answer): AnalysisError =>
-  adapterError(
-    operation,
-    answer.error ??
-      (answer.exited === undefined
-        ? `The capture did not answer in time. Its last progress: ${answer.progress ?? ""}`
-        : `The capture ended with exit status ${String(answer.exited)}. ${answer.output ?? ""} ${answer.progress ?? ""}`.trim()),
-  );
 
 /**
  * One capture in the computer. `unreleased` is a capture that may be
@@ -106,20 +220,31 @@ export class DesktopBuildCapture {
   #run: CaptureRun | undefined;
   readonly #entry: string | undefined;
   readonly #packageFile: { readonly url: string } | undefined;
+  /** What the request named beside the app, which the export installs too, so a package file's dependencies outlive an install by name. */
+  readonly #extraPackages: readonly string[];
 
+  /** The person's consents, in their words, which the export writes into consent.json. */
+  readonly #consents: BuildConsent[] = [];
+
+  /** `secrets` lists the secrets no exported bundle may hold and keeps the withheld files' bytes as secrets. */
   constructor(
     private readonly computer: ControlledComputer,
     request: BuildRequest | undefined,
+    private readonly secrets: {
+      readonly all: () => Promise<readonly KnownSecret[]>;
+      readonly keep: (handle: string, bytes: Buffer) => Promise<void>;
+    } = { all: () => Promise.resolve([]), keep: () => Promise.resolve() },
   ) {
     this.#entry = request?.desktop_entry;
     this.#packageFile =
       request?.install.kind === "package_file"
         ? { url: request.install.url }
         : undefined;
+    this.#extraPackages = request === undefined ? [] : extraPackagesOf(request);
   }
 
   async start(
-    input: { readonly arguments?: readonly string[] },
+    input: CaptureInput,
     signal: AbortSignal,
   ): Promise<
     Result<
@@ -154,6 +279,8 @@ export class DesktopBuildCapture {
       !(await this.#release(previous, signal))
     )
       return err(unreleasedError(START, previous, undefined));
+    const runtime = await checkExportRuntime(this.computer, signal);
+    if (!runtime.ok) return runtime;
     this.#count += 1;
     const run: CaptureRun = {
       folder: `${WORK}/captures/${String(this.#count)}`,
@@ -174,10 +301,20 @@ export class DesktopBuildCapture {
     return err(started.error.failure);
   }
 
+  /**
+   * The capture launched, then the caller cancelled before the start was
+   * reported. The next start stops it; until then it is not a second capture.
+   */
+  abandon(): void {
+    const run = this.#run;
+    if (run?.status === "running" && run.stopped === undefined)
+      run.status = "unreleased";
+  }
+
   async #launch(
     run: CaptureRun,
     entry: string,
-    input: { readonly arguments?: readonly string[] },
+    input: CaptureInput,
     signal: AbortSignal,
   ): Promise<
     Result<
@@ -199,6 +336,7 @@ export class DesktopBuildCapture {
           capture: run.folder,
           desktop_entry: entry,
           arguments: [...(input.arguments ?? [])],
+          state_paths: [...(input.state_paths ?? [])],
           ...(this.#packageFile === undefined
             ? {}
             : { package_file: BUILD_PACKAGE_FILE }),
@@ -210,9 +348,26 @@ export class DesktopBuildCapture {
     } catch (cause: unknown) {
       return err({ failure: adapterError(START, errorText(cause), cause) });
     }
+    if (answer.refused !== undefined)
+      return err({
+        failure: refused(
+          START,
+          answer.refused,
+          "Name files or folders under the computer's home in state_paths, relative to it or absolute, with no link on the way leading out of it.",
+        ),
+        answer,
+      });
     const event = answer.line === undefined ? undefined : eventOf(answer.line);
     if (event?.kind !== "window_open")
-      return err({ failure: notAnswered(START, answer), answer });
+      return err({
+        failure: await endedCapture(
+          this.computer,
+          { ...STARTING, folder: run.folder },
+          answer,
+          signal,
+        ),
+        answer,
+      });
     return ok({
       desktop_entry: entry,
       package_lists: answer.apt?.lists ?? 0,
@@ -265,10 +420,27 @@ export class DesktopBuildCapture {
         answer.line === undefined ? undefined : eventOf(answer.line);
       if (event?.kind === "checkpoint_refused")
         return err(refused(MARK, event.reason, "Use another checkpoint name."));
-      if (event?.kind !== "checkpoint") return err(notAnswered(MARK, answer));
+      if (event?.kind !== "checkpoint")
+        return err(
+          await endedCapture(
+            this.computer,
+            { ...marking(name), folder: run.folder },
+            answer,
+            signal,
+          ),
+        );
       run.checkpoints.add(name);
-      const { kind: _kind, ...taken } = event;
-      return ok(taken);
+      const {
+        kind: _kind,
+        changed_files: changed,
+        more_changed_files: more,
+        ...taken
+      } = event;
+      return ok({
+        ...taken,
+        changed_files: changed ?? null,
+        more_changed_files: more ?? null,
+      });
     } catch (cause: unknown) {
       return err(adapterError(MARK, errorText(cause), cause));
     }
@@ -327,6 +499,24 @@ export class DesktopBuildCapture {
     }
   }
 
+  /** Record a consent the person gave, in their own words, relayed by the agent; the export ships every one. */
+  recordConsent({
+    url,
+    ...consent
+  }: Omit<BuildConsent, "recorded_at" | "source">): {
+    readonly consent: Readonly<Record<string, JsonValue>>;
+    readonly consents: number;
+  } {
+    const recorded = {
+      ...consent,
+      ...(url === undefined ? {} : { url }),
+      recorded_at: new Date().toISOString(),
+      source: "relayed" as const,
+    };
+    this.#consents.push(recorded);
+    return { consent: recorded, consents: this.#consents.length };
+  }
+
   /** Export the bundle with the agent's task inside the computer and write it to a folder on this host. */
   async export(
     input: BuildExportRequest,
@@ -345,6 +535,28 @@ export class DesktopBuildCapture {
           "Capture with start_build_capture, mark seed and end, then call stop_build_capture.",
         ),
       );
+    const signIn = [SIGN_IN_START, SIGN_IN_END].filter((name) =>
+      run.checkpoints.has(name),
+    );
+    if (signIn.length === 1)
+      return err(
+        refused(
+          EXPORT,
+          `The capture has ${signIn.join("")} but not ${signIn[0] === SIGN_IN_START ? SIGN_IN_END : SIGN_IN_START}, so REA cannot tell which files the sign-in wrote.`,
+          `Capture again on a new build computer, marking ${SIGN_IN_START} before the sign-in and ${SIGN_IN_END} after it.`,
+        ),
+      );
+    if (
+      input.seed_sign_in === true &&
+      !this.#consents.some(({ kind }) => kind === "seed_sign_in")
+    )
+      return err(
+        refused(
+          EXPORT,
+          "Seeding the withheld sign-in state needs the person's consent, and record_build_consent recorded none on this computer.",
+          "Ask the person whether the bundle may hold their signed-in state; if they say yes, record their words with record_build_consent, kind seed_sign_in, then export again. Otherwise export without seed_sign_in.",
+        ),
+      );
     run.exports += 1;
     return exportBuild(
       this.computer,
@@ -354,6 +566,11 @@ export class DesktopBuildCapture {
         ...(this.#packageFile === undefined || run.packageFile !== true
           ? {}
           : { packageUrl: this.#packageFile.url }),
+        extraPackages: this.#extraPackages,
+        secrets: await this.secrets.all(),
+        keep: this.secrets.keep,
+        signIn: signIn.length === 2,
+        consents: [...this.#consents],
       },
       input,
       signal,
